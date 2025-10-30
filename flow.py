@@ -1,265 +1,220 @@
 # streamlit_app.py
-# 🎾 API Tennis → Snowflake sin External Access (Streamlit hace la llamada HTTP)
-# - Elige DB/Schema/Tabla desde la UI (por defecto: TENNIS_DB.RAW.RAW_TENNIS_MATCH_KEYS)
-# - Trae fixtures por fecha y timezone desde https://api.api-tennis.com
-# - Si el entorno bloquea internet, sube un JSON (payload del API) y guarda igual
-# - Inserta/actualiza por (source_date, timezone_used): borra y carga
+# ✅ Funciona en Snowflake Streamlit
+# 🎾 Tennis API → Snowflake Table (sin external access)
+# Plan A: Llama API desde Streamlit (si tu Snowflake lo permite)
+# Plan B: Subes JSON con los partidos → se guardan igual
 
-import io
-import json
-import datetime as dt
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import requests
+import datetime as dt
+import json
 from snowflake.snowpark.context import get_active_session
 
-# -------------------------------
-# Configuración básica de página
-# -------------------------------
-st.set_page_config(page_title="Tennis Match Keys → Snowflake", layout="wide")
-st.title("🎾 Tennis Match Keys → Snowflake (sin External Access)")
-st.caption("Streamlit hace la llamada HTTP. Si la red está bloqueada, usa la carga por JSON.")
+# ----------------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------------
+st.set_page_config(page_title="🎾 Tennis Loader", layout="wide")
+st.title("🎾 Cargar Match Keys de Tennis a Snowflake")
 
-# -------------------------------
-# Conexión Snowflake
-# -------------------------------
 session = get_active_session()
 
-def run_sql(sql: str):
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
+def run_sql(sql):
     return session.sql(sql).collect()
 
-def set_context(warehouse: str, db: str, schema: str):
-    run_sql(f"use warehouse {warehouse}")
+def ensure_table(db, schema, table):
     run_sql(f"create database if not exists {db}")
     run_sql(f"use database {db}")
     run_sql(f"create schema if not exists {db}.{schema}")
     run_sql(f"use schema {schema}")
-
-def table_fqn(db: str, schema: str, table: str) -> str:
-    return f'{db}.{schema}.{table}'
-
-def ensure_table(db: str, schema: str, table: str):
-    tbl = table_fqn(db, schema, table)
     run_sql(f"""
-        create table if not exists {tbl} (
-          event_key         string,
-          event_date        string,
-          event_time        string,
-          first_player      string,
-          second_player     string,
-          tournament_name   string,
-          event_type_type   string,
-          event_status      string,
-          source_date       date,
-          timezone_used     string,
-          _ingested_at      timestamp_ntz default current_timestamp()
+        create table if not exists {db}.{schema}.{table} (
+            event_key string,
+            event_date string,
+            event_time string,
+            first_player string,
+            second_player string,
+            tournament_name string,
+            event_type_type string,
+            event_status string,
+            source_date date,
+            timezone_used string,
+            _ingested_at timestamp_ntz default current_timestamp()
         )
     """)
 
-def df_to_csv_download(df: pd.DataFrame, filename: str, label: str = "⬇️ Descargar CSV"):
-    if df is None or df.empty:
-        return
-    st.download_button(
-        label=label,
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=filename,
-        mime="text/csv",
-        use_container_width=True
-    )
+def delete_existing(db, schema, table, date, tz):
+    run_sql(f"""
+        delete from {db}.{schema}.{table}
+        where source_date = to_date('{date}')
+          and timezone_used = '{tz}'
+    """)
 
-# -------------------------------
-# Parámetros UI
-# -------------------------------
-with st.sidebar:
-    st.header("⚙️ Contexto Snowflake")
-    warehouse = st.text_input("Warehouse", value="COMPUTE_WH")
-    db = st.text_input("Database", value="TENNIS_DB")
-    schema = st.text_input("Schema", value="RAW")
-    table = st.text_input("Tabla", value="RAW_TENNIS_MATCH_KEYS")
-    st.caption("Se crearán DB/Schema/Tabla si no existen (si tu rol lo permite).")
+def insert_df(df, db, schema, table, date, tz):
+    df2 = df.copy()
+    df2["source_date"] = date
+    df2["timezone_used"] = tz
+    session.write_pandas(df2, f"{db}.{schema}.{table}", auto_create_table=False)
 
-colA, colB, colC, colD = st.columns([1, 1, 1, 2])
-with colA:
-    fecha = st.date_input("Fecha", value=dt.date.today(), format="YYYY-MM-DD")
-with colB:
-    timezone = st.text_input("Timezone", value="America/Monterrey")
-with colC:
-    api_key = st.text_input("API Key", type="password", help="Tu API key de api-tennis.com")
-with colD:
-    st.write("")
-
-date_str = fecha.strftime("%Y-%m-%d")
-tbl_fqn = table_fqn(db, schema, table)
-
-st.markdown("---")
-
-# -------------------------------
-# Funciones de negocio
-# -------------------------------
-import requests
-
-BASE_URL = "https://api.api-tennis.com/tennis/"
-HEADERS = {"Accept": "application/json"}
-
-def fetch_from_api(api_key: str, date_str: str, tz: str):
+def fetch_api(api_key, date, tz):
+    URL = "https://api.api-tennis.com/tennis/"
     params = {
-        "method": "get_fixtures",
-        "APIkey": api_key,
-        "date_start": date_str,
-        "date_stop":  date_str,
-        "timezone":   tz
+        "method":"get_fixtures",
+        "APIkey":api_key,
+        "date_start":date,
+        "date_stop":date,
+        "timezone":tz
     }
-    r = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=40)
+    r = requests.get(URL, params=params, timeout=40)
     r.raise_for_status()
     return r.json()
 
-def normalize_result(result_list):
-    rows = []
-    for item in result_list or []:
+def normalize(data):
+    rows=[]
+    for x in data:
         rows.append({
-            "event_key":       str(item.get("event_key") or item.get("match_key") or ""),
-            "event_date":      item.get("event_date", ""),
-            "event_time":      item.get("event_time", ""),
-            "first_player":    item.get("event_first_player", ""),
-            "second_player":   item.get("event_second_player", ""),
-            "tournament_name": item.get("tournament_name", ""),
-            "event_type_type": item.get("event_type_type", ""),
-            "event_status":    item.get("event_status", "")
+            "event_key": str(x.get("event_key") or x.get("match_key") or ""),
+            "event_date": x.get("event_date",""),
+            "event_time": x.get("event_time",""),
+            "first_player": x.get("event_first_player",""),
+            "second_player": x.get("event_second_player",""),
+            "tournament_name": x.get("tournament_name",""),
+            "event_type_type": x.get("event_type_type",""),
+            "event_status": x.get("event_status","")
         })
-    return rows
+    return pd.DataFrame(rows)
 
-def upsert_rows(df: pd.DataFrame, date_str: str, tz: str):
-    # Simple: delete + insert por (source_date, timezone_used)
-    run_sql(f"""
-        delete from {tbl_fqn}
-        where source_date = to_date('{date_str}')
-          and timezone_used = '{tz}'
-    """)
-    if not df.empty:
-        # Agrega columnas control
-        df = df.copy()
-        df["source_date"] = date_str
-        df["timezone_used"] = tz
-        session.write_pandas(df, tbl_fqn, auto_create_table=False)
+# ----------------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Configuración Snowflake")
+    warehouse = st.text_input("Warehouse", "COMPUTE_WH")
+    db = st.text_input("Database", "TENNIS_DB")
+    schema = st.text_input("Schema", "RAW")
+    table = st.text_input("Table", "RAW_TENNIS_MATCH_KEYS")
 
-# -------------------------------
-# Acciones
-# -------------------------------
-b1, b2, b3 = st.columns([1.4, 1.4, 2])
-with b1:
-    do_fetch = st.button("📥 Traer desde API", use_container_width=True)
-with b2:
-    do_save = st.button("💾 Guardar en Snowflake", use_container_width=True)
-with b3:
+    st.header("🌎 API Tennis")
+    api_key = st.text_input("API Key", type="password")
+
+col1,col2,col3,_ = st.columns([1,1,1,2])
+with col1:
+    fecha = st.date_input("Fecha", dt.date.today(), format="YYYY-MM-DD")
+with col2:
+    timezone = st.text_input("Timezone", "America/Monterrey")
+with col3:
     st.write("")
 
-st.info(f"Destino: **{tbl_fqn}**")
+date_str = fecha.strftime("%Y-%m-%d")
 
-# Asegurar contexto y tabla
+# ----------------------------------------------------------------------------
+# Setup DB + Table
+# ----------------------------------------------------------------------------
 try:
-    set_context(warehouse, db, schema)
+    run_sql(f"use warehouse {warehouse}")
     ensure_table(db, schema, table)
+    st.success(f"Conectado a ➜ `{db}.{schema}.{table}`")
 except Exception as e:
-    st.error(f"Error de contexto/DDL: {e}")
+    st.error(f"❌ Error conectando/creando tabla: {e}")
 
-session_state_key = "df_preview"
-if session_state_key not in st.session_state:
-    st.session_state[session_state_key] = pd.DataFrame()
+# ----------------------------------------------------------------------------
+# Actions
+# ----------------------------------------------------------------------------
+btn_api  = st.button("📥 Traer desde API")
+btn_save = st.button("💾 Guardar en Snowflake")
 
-df_preview: pd.DataFrame = st.session_state[session_state_key]
+st.subheader("📄 Plan B: Subir JSON del API (si no hay internet)")
+upload = st.file_uploader("Sube archivo JSON", type=["json"])
 
-# 1) Traer datos desde API
-if do_fetch:
+# Memory
+if "df_buf" not in st.session_state:
+    st.session_state.df_buf = pd.DataFrame()
+
+# ----------------------------------------------------------------------------
+# API FETCH
+# ----------------------------------------------------------------------------
+if btn_api:
     if not api_key.strip():
-        st.warning("Ingresa tu **API Key**.")
+        st.warning("Ingresa API Key primero.")
     else:
-        with st.spinner("Llamando API…"):
-            try:
-                payload = fetch_from_api(api_key.strip(), date_str, timezone.strip())
-                ok = bool(payload.get("success") == 1)
-                if not ok:
-                    st.error(f"API success!=1. Respuesta: {payload}")
-                else:
-                    rows = normalize_result(payload.get("result") or [])
-                    df_preview = pd.DataFrame(rows)
-                    st.session_state[session_state_key] = df_preview
-                    st.success(f"OK. {len(df_preview)} partidos para {date_str} ({timezone}).")
-            except Exception as e:
-                st.error(f"No se pudo llamar al API desde Streamlit.\n"
-                         f"Posible bloqueo de red en tu cuenta Snowflake.\n\nDetalle: {e}")
-
-# 2) Plan B: subir JSON si no hay internet
-st.markdown("#### 📄 Plan B: Subir JSON del API (payload)")
-st.caption("Si tu cuenta bloquea internet, pega el JSON del endpoint o súbelo como archivo.")
-uploaded = st.file_uploader("Sube un archivo .json", type=["json"])
-raw_json_text = st.text_area("…o pega el JSON aquí")
-
-if st.button("➡️ Procesar JSON", use_container_width=True):
-    try:
-        data = None
-        if uploaded is not None:
-            data = json.load(uploaded)
-        elif raw_json_text.strip():
-            data = json.loads(raw_json_text)
-        else:
-            st.warning("Sube un archivo o pega JSON.")
-            data = None
-
-        if data is not None:
-            ok = bool(data.get("success") == 1)
-            if not ok:
-                st.error(f"JSON no tiene success==1. Respuesta: {data}")
+        try:
+            st.info("Llamando API...")
+            data = fetch_api(api_key.strip(), date_str, timezone.strip())
+            if data.get("success") != 1:
+                st.error(f"API devolvió error: {data}")
             else:
-                rows = normalize_result(data.get("result") or [])
-                df_preview = pd.DataFrame(rows)
-                st.session_state[session_state_key] = df_preview
-                st.success(f"JSON procesado. {len(df_preview)} partidos.")
+                st.session_state.df_buf = normalize(data.get("result", []))
+                st.success(f"✅ {len(st.session_state.df_buf)} partidos obtenidos")
+        except Exception as e:
+            st.error(f"❌ Error llamando API desde Snowflake Streamlit.\n"
+                     f"Tu cuenta puede no tener salida de red.\n\n{e}")
+
+# ----------------------------------------------------------------------------
+# JSON Upload
+# ----------------------------------------------------------------------------
+if upload:
+    try:
+        raw = json.load(upload)
+        if raw.get("success") != 1:
+            st.error("JSON no contiene success=1")
+        else:
+            st.session_state.df_buf = normalize(raw.get("result", []))
+            st.success(f"✅ {len(st.session_state.df_buf)} partidos cargados desde JSON")
     except Exception as e:
-        st.error(f"JSON inválido: {e}")
+        st.error(f"❌ JSON inválido: {e}")
 
-st.markdown("---")
-
-# Vista previa + descarga
+# ----------------------------------------------------------------------------
+# Preview
+# ----------------------------------------------------------------------------
 st.subheader("📊 Vista previa")
-if df_preview is not None and not df_preview.empty:
-    st.dataframe(df_preview, use_container_width=True, height=420)
-    df_to_csv_download(df_preview, f"match_keys_{date_str}.csv")
+df = st.session_state.df_buf
+
+if df.empty:
+    st.info("Sin datos aún.")
 else:
-    st.info("No hay datos todavía. Usa **Traer desde API** o **Procesar JSON**.")
+    st.dataframe(df, use_container_width=True, height=400)
+    st.download_button(
+        "⬇️ Descargar CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        f"match_keys_{date_str}.csv"
+    )
 
-# Guardar en Snowflake
-if do_save:
-    if df_preview is None or df_preview.empty:
-        st.warning("Primero trae o sube datos.")
+# ----------------------------------------------------------------------------
+# Save
+# ----------------------------------------------------------------------------
+if btn_save:
+    if df.empty:
+        st.warning("No hay datos para guardar")
     else:
-        with st.spinner("Guardando en Snowflake…"):
-            try:
-                upsert_rows(df_preview, date_str, timezone.strip())
-                st.success(f"Guardado en {tbl_fqn}.")
-            except Exception as e:
-                st.error(f"Error al guardar: {e}")
+        try:
+            delete_existing(db, schema, table, date_str, timezone.strip())
+            insert_df(df, db, schema, table, date_str, timezone.strip())
+            st.success("✅ Datos guardados en Snowflake")
+        except Exception as e:
+            st.error(f"❌ Error guardando: {e}")
 
-st.markdown("---")
+# ----------------------------------------------------------------------------
+# Query
+# ----------------------------------------------------------------------------
+st.subheader("🔎 Ver datos en Snowflake")
+limit = st.number_input("Límite", 1, 10000, 100)
 
-# Consulta rápida
-st.subheader("🔎 Consultar en Snowflake")
-lim = st.number_input("Límite", min_value=1, max_value=10000, value=200, step=50)
-query = f"""
-select
-  event_key, event_date, event_time, first_player, second_player,
-  tournament_name, event_type_type, event_status,
-  source_date, timezone_used, _ingested_at
-from {tbl_fqn}
+q = f"""
+select *
+from {db}.{schema}.{table}
 where source_date = to_date('{date_str}')
   and timezone_used = '{timezone}'
-order by tournament_name, event_time, event_key
-limit {int(lim)}
+order by tournament_name, event_time
+limit {limit}
 """
-st.code(query.strip(), language="sql")
+st.code(q, language="sql")
 
 try:
-    df_db = session.sql(query).to_pandas()
-    st.dataframe(df_db, use_container_width=True, height=360)
-except Exception as e:
-    st.warning(f"No se pudo consultar: {e}")
+    df_db = session.sql(q).to_pandas()
+    st.dataframe(df_db, use_container_width=True, height=350)
+except:
+    st.warning("Aún sin datos o error en consulta.")
 
-st.caption("Tip: si el botón 'Traer desde API' falla por red, usa el Plan B (sube JSON) y luego 'Guardar en Snowflake'.")
