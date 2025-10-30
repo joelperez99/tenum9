@@ -1,173 +1,241 @@
-import streamlit as st
-import pandas as pd
+import os
+import json
 import requests
 import datetime as dt
-import json
-import os
+import pandas as pd
+import streamlit as st
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 
-# ------------------------------
-# Config Streamlit
-# ------------------------------
-st.set_page_config(page_title="🎾 Tennis Loader", layout="wide")
-st.title("🎾 Tennis Match Keys → Snowflake")
+st.set_page_config(page_title="🎾 Tennis → Snowflake", layout="wide")
+st.title("🎾 Cargar Match Keys (API Tennis) → Snowflake")
 
-# ------------------------------
-# Credenciales desde secrets/env
-# ------------------------------
+# -----------------------------
+# Helpers credenciales
+# -----------------------------
+def _get_secret(name, default=""):
+    # Usa secrets de Streamlit Cloud primero, luego variables de entorno
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
+
+# Lee credenciales Snowflake (desde Secrets o ENV)
+SF_ACCOUNT   = _get_secret("SF_ACCOUNT")
+SF_USER      = _get_secret("SF_USER")
+SF_PASSWORD  = _get_secret("SF_PASSWORD")
+SF_ROLE      = _get_secret("SF_ROLE", "ACCOUNTADMIN")
+SF_WAREHOUSE = _get_secret("SF_WAREHOUSE", "COMPUTE_WH")
+SF_DATABASE  = _get_secret("SF_DATABASE", "TENNIS_DB")
+SF_SCHEMA    = _get_secret("SF_SCHEMA", "RAW")
+SF_TABLE     = _get_secret("SF_TABLE", "RAW_TENNIS_MATCH_KEYS")
+
+# -----------------------------
+# Conexión Snowflake
+# -----------------------------
+@st.cache_resource(show_spinner=False)
 def get_sf_conn():
+    if not (SF_ACCOUNT and SF_USER and SF_PASSWORD):
+        raise RuntimeError("Faltan credenciales SF_ACCOUNT/SF_USER/SF_PASSWORD en Secrets.")
     return snowflake.connector.connect(
-        account=os.getenv("SF_ACCOUNT", st.secrets.get("SF_ACCOUNT")),
-        user=os.getenv("SF_USER", st.secrets.get("SF_USER")),
-        password=os.getenv("SF_PASSWORD", st.secrets.get("SF_PASSWORD")),
-        role=os.getenv("SF_ROLE", st.secrets.get("SF_ROLE")),
-        warehouse=os.getenv("SF_WAREHOUSE", st.secrets.get("SF_WAREHOUSE")),
-        database=os.getenv("SF_DATABASE", st.secrets.get("SF_DATABASE")),
-        schema=os.getenv("SF_SCHEMA", st.secrets.get("SF_SCHEMA")),
+        account=SF_ACCOUNT,
+        user=SF_USER,
+        password=SF_PASSWORD,
+        role=SF_ROLE,
+        warehouse=SF_WAREHOUSE,
+        database=SF_DATABASE,
+        schema=SF_SCHEMA,
     )
 
-DB = os.getenv("SF_DATABASE", st.secrets.get("SF_DATABASE"))
-SCHEMA = os.getenv("SF_SCHEMA", st.secrets.get("SF_SCHEMA"))
-TABLE = os.getenv("SF_TABLE", st.secrets.get("SF_TABLE"))
+def sf_exec(cnx, sql):
+    cur = cnx.cursor()
+    try:
+        cur.execute(sql)
+        try:
+            return cur.fetchall()
+        except Exception:
+            return []
+    finally:
+        cur.close()
 
-# ------------------------------
-# DB helpers
-# ------------------------------
-def ensure_table(cnx):
-    cnx.cursor().execute(f"""
-        create table if not exists {DB}.{SCHEMA}.{TABLE} (
-            event_key string,
-            event_date string,
-            event_time string,
-            first_player string,
-            second_player string,
-            tournament_name string,
-            event_type_type string,
-            event_status string,
-            source_date date,
-            timezone_used string,
-            _ingested_at timestamp default current_timestamp()
+def ensure_objects(cnx):
+    sf_exec(cnx, f"create database if not exists {SF_DATABASE}")
+    sf_exec(cnx, f"create schema if not exists {SF_DATABASE}.{SF_SCHEMA}")
+    sf_exec(cnx, f"use database {SF_DATABASE}")
+    sf_exec(cnx, f"use schema {SF_SCHEMA}")
+    sf_exec(cnx, f"""
+        create table if not exists {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE} (
+          event_key string,
+          event_date string,
+          event_time string,
+          first_player string,
+          second_player string,
+          tournament_name string,
+          event_type_type string,
+          event_status string,
+          source_date date,
+          timezone_used string,
+          _ingested_at timestamp_ntz default current_timestamp()
         )
     """)
 
-def delete_existing(cnx, date, tz):
-    cnx.cursor().execute(f"""
-        delete from {DB}.{SCHEMA}.{TABLE}
-        where source_date = to_date('{date}')
-          and timezone_used = '{tz}'
+def delete_partition(cnx, date_str, timezone):
+    sf_exec(cnx, f"""
+        delete from {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
+        where source_date = to_date('{date_str}')
+          and timezone_used = '{timezone}'
     """)
 
-def write_df(cnx, df):
-    write_pandas(cnx, df, TABLE, database=DB, schema=SCHEMA)
+def insert_df(cnx, df):
+    write_pandas(
+        conn=cnx,
+        df=df,
+        table_name=SF_TABLE,
+        database=SF_DATABASE,
+        schema=SF_SCHEMA
+    )
 
-# ------------------------------
-# API Tennis functions
-# ------------------------------
-def fetch_api(api_key, date, tz):
-    url = "https://api.api-tennis.com/tennis/"
-    params = {
-        "method":"get_fixtures",
-        "APIkey":api_key,
-        "date_start":date,
-        "date_stop":date,
-        "timezone":tz
-    }
-    r = requests.get(url, params=params, timeout=40)
+# -----------------------------
+# API Tennis
+# -----------------------------
+BASE_URL = "https://api.api-tennis.com/tennis/"
+
+def fetch_api(api_key: str, date_str: str, timezone: str) -> dict:
+    r = requests.get(
+        BASE_URL,
+        params={
+            "method": "get_fixtures",
+            "APIkey": api_key,
+            "date_start": date_str,
+            "date_stop": date_str,
+            "timezone": timezone
+        },
+        timeout=40
+    )
     r.raise_for_status()
     return r.json()
 
-def normalize(data):
-    rows=[]
-    for x in data:
+def normalize_result(result_list):
+    rows = []
+    for it in (result_list or []):
         rows.append({
-            "event_key": str(x.get("event_key") or x.get("match_key") or ""),
-            "event_date": x.get("event_date",""),
-            "event_time": x.get("event_time",""),
-            "first_player": x.get("event_first_player",""),
-            "second_player": x.get("event_second_player",""),
-            "tournament_name": x.get("tournament_name",""),
-            "event_type_type": x.get("event_type_type",""),
-            "event_status": x.get("event_status","")
+            "event_key":       str(it.get("event_key") or it.get("match_key") or ""),
+            "event_date":      it.get("event_date", ""),
+            "event_time":      it.get("event_time", ""),
+            "first_player":    it.get("event_first_player", ""),
+            "second_player":   it.get("event_second_player", ""),
+            "tournament_name": it.get("tournament_name", ""),
+            "event_type_type": it.get("event_type_type", ""),
+            "event_status":    it.get("event_status", "")
         })
     return pd.DataFrame(rows)
 
-# ------------------------------
+# -----------------------------
 # UI
-# ------------------------------
+# -----------------------------
 with st.sidebar:
-    api_key = st.text_input("API Key", type="password")
-    fecha = st.date_input("Fecha", dt.date.today())
-    timezone = st.text_input("Timezone", "America/Monterrey")
+    st.header("🌍 API Tennis")
+    api_key = st.text_input("API Key", type="password", help="Tu API key de api-tennis.com")
+    fecha = st.date_input("Fecha", value=dt.date.today(), format="YYYY-MM-DD")
+    timezone = st.text_input("Timezone", value="America/Monterrey")
 
 date_str = fecha.strftime("%Y-%m-%d")
 
-btn_fetch = st.button("📡 Traer desde API")
-btn_save = st.button("💾 Guardar en Snowflake")
+col1, col2, col3 = st.columns([1.2, 1.2, 2])
+with col1:
+    do_fetch = st.button("📡 Traer desde API")
+with col2:
+    do_save = st.button("💾 Guardar en Snowflake")
 
-st.subheader("📂 O subir JSON manual")
-upload = st.file_uploader("JSON API", type=["json"])
+st.markdown("#### 📄 Plan B: subir JSON del API (si prefieres pegar el payload)")
+upl = st.file_uploader("Archivo .json", type=["json"])
 
-if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame()
+# buffer de datos
+if "df_buf" not in st.session_state:
+    st.session_state.df_buf = pd.DataFrame()
 
-# ------------------------------
-# Fetch API
-# ------------------------------
-if btn_fetch:
-    if not api_key:
-        st.warning("Ingresa la API key")
+# -----------------------------
+# Acciones
+# -----------------------------
+if do_fetch:
+    if not api_key.strip():
+        st.warning("Ingresa tu API Key.")
     else:
         try:
-            data = fetch_api(api_key, date_str, timezone)
-            if data.get("success") != 1:
-                st.error(data)
+            payload = fetch_api(api_key.strip(), date_str, timezone.strip())
+            if payload.get("success") != 1:
+                st.error(f"Error de API: {payload}")
             else:
-                st.session_state.df = normalize(data["result"])
-                st.success(f"{len(st.session_state.df)} partidos obtenidos")
+                st.session_state.df_buf = normalize_result(payload.get("result"))
+                st.success(f"OK. {len(st.session_state.df_buf)} partidos.")
         except Exception as e:
-            st.error(e)
+            st.error(f"Error llamando API: {e}")
 
-# ------------------------------
-# JSON upload
-# ------------------------------
-if upload:
-    raw = json.load(upload)
-    if raw.get("success") != 1:
-        st.error("JSON incorrecto")
-    else:
-        st.session_state.df = normalize(raw["result"])
-        st.success(f"{len(st.session_state.df)} partidos cargados")
+if upl is not None:
+    try:
+        data = json.load(upl)
+        if data.get("success") != 1:
+            st.error("JSON no contiene success=1")
+        else:
+            st.session_state.df_buf = normalize_result(data.get("result"))
+            st.success(f"JSON cargado. {len(st.session_state.df_buf)} partidos.")
+    except Exception as e:
+        st.error(f"JSON inválido: {e}")
 
-# ------------------------------
-# Preview
-# ------------------------------
-st.write("### Vista previa")
-df = st.session_state.df
+st.markdown("---")
+st.subheader("📊 Vista previa")
+df = st.session_state.df_buf
 if df.empty:
-    st.info("No hay datos aún")
+    st.info("Sin datos aún. Usa 'Traer desde API' o sube un JSON.")
 else:
-    st.dataframe(df, height=350)
-    st.download_button("⬇️ CSV", df.to_csv(index=False), f"matches_{date_str}.csv")
+    st.dataframe(df, use_container_width=True, height=420)
+    st.download_button(
+        "⬇️ Descargar CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name=f"match_keys_{date_str}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
-# ------------------------------
-# Save to Snowflake
-# ------------------------------
-if btn_save:
+if do_save:
     if df.empty:
-        st.warning("No hay datos para guardar")
+        st.warning("No hay datos para guardar.")
     else:
         try:
             cnx = get_sf_conn()
-            ensure_table(cnx)
-            delete_existing(cnx, date_str, timezone)
+            ensure_objects(cnx)
+            delete_partition(cnx, date_str, timezone.strip())
             df2 = df.copy()
             df2["source_date"] = date_str
-            df2["timezone_used"] = timezone
-            write_df(cnx, df2)
-            st.success("✅ Guardado en Snowflake")
+            df2["timezone_used"] = timezone.strip()
+            insert_df(cnx, df2)
+            st.success(f"Guardado en {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}")
         except Exception as e:
-            st.error(e)
+            st.error(f"Error guardando en Snowflake: {e}")
         finally:
-            try: cnx.close()
-            except: pass
+            try:
+                cnx.close()
+            except Exception:
+                pass
+
+st.markdown("---")
+st.subheader("🔎 Consulta rápida en Snowflake")
+lim = st.number_input("Límite", 1, 10000, 200, 50)
+q = f"""
+select event_key,event_date,event_time,first_player,second_player,
+       tournament_name,event_type_type,event_status,
+       source_date,timezone_used,_ingested_at
+from {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
+where source_date = to_date('{date_str}')
+  and timezone_used = '{timezone}'
+order by tournament_name, event_time, event_key
+limit {int(lim)}
+"""
+st.code(q, language="sql")
+try:
+    cnx2 = get_sf_conn()
+    df_db = pd.read_sql(q, cnx2)
+    cnx2.close()
+    st.dataframe(df_db, use_container_width=True, height=360)
+except Exception as e:
+    st.info(f"No se pudo consultar (¿tabla aún vacía?). Detalle: {e}")
