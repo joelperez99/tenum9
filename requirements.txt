@@ -2,4 +2,5 @@ streamlit
 pandas
 requests
 snowflake-connector-python
-snowflake-sqlalchemy
+snowflake-connector-python[pandas]
+streamlit-extras
