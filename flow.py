@@ -59,10 +59,10 @@ def sf_exec(cnx, sql):
         cur.close()
 
 def ensure_objects(cnx):
-    sf_exec(cnx, f"create database if not exists {SF_DATABASE}")
-    sf_exec(cnx, f"create schema if not exists {SF_DATABASE}.{SF_SCHEMA}")
-    sf_exec(cnx, f"use database {SF_DATABASE}")
-    sf_exec(cnx, f"use schema {SF_SCHEMA}")
+    sf_exec(cnx, f"create database if not exists { SF_DATABASE }")
+    sf_exec(cnx, f"create schema if not exists { SF_DATABASE }.{ SF_SCHEMA }")
+    sf_exec(cnx, f"use database { SF_DATABASE }")
+    sf_exec(cnx, f"use schema { SF_SCHEMA }")
     sf_exec(cnx, f"""
         create table if not exists {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE} (
           event_key string,
@@ -79,10 +79,14 @@ def ensure_objects(cnx):
         )
     """)
 
-def delete_partition(cnx, date_str, timezone):
+def delete_partition_range(cnx, start_str, stop_str, timezone):
+    """
+    Borra todas las filas del rango [start_str, stop_str]
+    para el timezone indicado.
+    """
     sf_exec(cnx, f"""
         delete from {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
-        where source_date = to_date('{date_str}')
+        where source_date between to_date('{start_str}') and to_date('{stop_str}')
           and timezone_used = '{timezone}'
     """)
 
@@ -100,14 +104,17 @@ def insert_df(cnx, df):
 # -----------------------------
 BASE_URL = "https://api.api-tennis.com/tennis/"
 
-def fetch_api(api_key: str, date_str: str, timezone: str) -> dict:
+def fetch_api(api_key: str, date_start_str: str, date_stop_str: str, timezone: str) -> dict:
+    """
+    Llama a la API usando un rango de fechas [date_start_str, date_stop_str].
+    """
     r = requests.get(
         BASE_URL,
         params={
             "method": "get_fixtures",
             "APIkey": api_key,
-            "date_start": date_str,
-            "date_stop": date_str,
+            "date_start": date_start_str,
+            "date_stop": date_stop_str,
             "timezone": timezone
         },
         timeout=40
@@ -136,10 +143,17 @@ def normalize_result(result_list):
 with st.sidebar:
     st.header("🌍 API Tennis")
     api_key = st.text_input("API Key", type="password", help="Tu API key de api-tennis.com")
-    fecha = st.date_input("Fecha", value=dt.date.today(), format="YYYY-MM-DD")
+    fecha_desde = st.date_input("Fecha desde", value=dt.date.today(), format="YYYY-MM-DD")
+    fecha_hasta = st.date_input("Fecha hasta", value=dt.date.today(), format="YYYY-MM-DD")
     timezone = st.text_input("Timezone", value="America/Monterrey")
 
-date_str = fecha.strftime("%Y-%m-%d")
+# Strings de fechas
+start_str = fecha_desde.strftime("%Y-%m-%d")
+stop_str  = fecha_hasta.strftime("%Y-%m-%d")
+
+# Validación rápida del rango
+if fecha_hasta < fecha_desde:
+    st.sidebar.error("⚠️ La 'Fecha hasta' no puede ser menor que la 'Fecha desde'.")
 
 col1, col2, col3 = st.columns([1.2, 1.2, 2])
 with col1:
@@ -160,14 +174,16 @@ if "df_buf" not in st.session_state:
 if do_fetch:
     if not api_key.strip():
         st.warning("Ingresa tu API Key.")
+    elif fecha_hasta < fecha_desde:
+        st.error("Rango de fechas inválido. Corrige 'Fecha desde' y 'Fecha hasta'.")
     else:
         try:
-            payload = fetch_api(api_key.strip(), date_str, timezone.strip())
+            payload = fetch_api(api_key.strip(), start_str, stop_str, timezone.strip())
             if payload.get("success") != 1:
                 st.error(f"Error de API: {payload}")
             else:
                 st.session_state.df_buf = normalize_result(payload.get("result"))
-                st.success(f"OK. {len(st.session_state.df_buf)} partidos.")
+                st.success(f"OK. {len(st.session_state.df_buf)} partidos entre {start_str} y {stop_str}.")
         except Exception as e:
             st.error(f"Error llamando API: {e}")
 
@@ -194,9 +210,7 @@ else:
     # ================================
     # 🔵 Botón: Copiar Match Keys
     # ================================
-    # Creamos un string con todos los event_key, uno por línea
     matchkeys_str = "\n".join(df["event_key"].astype(str).tolist())
-    # Lo serializamos como JSON para que se escape bien en JS
     matchkeys_json = json.dumps(matchkeys_str)
 
     st.markdown(
@@ -220,7 +234,7 @@ else:
     st.download_button(
         "⬇️ Descargar CSV",
         df.to_csv(index=False).encode("utf-8"),
-        file_name=f"match_keys_{date_str}.csv",
+        file_name=f"match_keys_{start_str}_a_{stop_str}.csv",
         mime="text/csv",
         use_container_width=True
     )
@@ -231,16 +245,30 @@ else:
 if do_save:
     if df.empty:
         st.warning("No hay datos para guardar.")
+    elif fecha_hasta < fecha_desde:
+        st.error("Rango de fechas inválido. Corrige 'Fecha desde' y 'Fecha hasta'.")
     else:
         try:
             cnx = get_sf_conn()
             ensure_objects(cnx)
-            delete_partition(cnx, date_str, timezone.strip())
+
+            # Borra partición del rango
+            delete_partition_range(cnx, start_str, stop_str, timezone.strip())
+
+            # Prepara DF para Snowflake
             df2 = df.copy()
-            df2["source_date"] = date_str
+            # Usa event_date como source_date; si falla, cae en start_str
+            try:
+                df2["source_date"] = pd.to_datetime(df2["event_date"], errors="coerce").dt.date
+                default_date = pd.to_datetime(start_str).date()
+                df2["source_date"] = df2["source_date"].fillna(default_date)
+            except Exception:
+                df2["source_date"] = pd.to_datetime(start_str).date()
+
             df2["timezone_used"] = timezone.strip()
+
             insert_df(cnx, df2)
-            st.success(f"Guardado en {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}")
+            st.success(f"Guardado en {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE} (rango {start_str} a {stop_str}).")
         except Exception as e:
             st.error(f"Error guardando en Snowflake: {e}")
         finally:
@@ -251,18 +279,21 @@ if do_save:
 
 st.markdown("---")
 st.subheader("🔎 Consulta rápida en Snowflake")
+
 lim = st.number_input("Límite", 1, 10000, 200, 50)
+
 q = f"""
 select event_key,event_date,event_time,first_player,second_player,
        tournament_name,event_type_type,event_status,
        source_date,timezone_used,_ingested_at
 from {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
-where source_date = to_date('{date_str}')
+where source_date between to_date('{start_str}') and to_date('{stop_str}')
   and timezone_used = '{timezone}'
 order by tournament_name, event_time, event_key
 limit {int(lim)}
 """
 st.code(q, language="sql")
+
 try:
     cnx2 = get_sf_conn()
     df_db = pd.read_sql(q, cnx2)
