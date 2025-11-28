@@ -6,7 +6,6 @@ import pandas as pd
 import streamlit as st
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
-from streamlit_extras.copy_to_clipboard import copy_to_clipboard  # 👈 NUEVO
 
 st.set_page_config(page_title="🎾 Tennis → Snowflake", layout="wide")
 st.title("🎾 Cargar Match Keys (API Tennis) → Snowflake")
@@ -193,14 +192,29 @@ else:
     st.dataframe(df, use_container_width=True, height=420)
 
     # ================================
-    # 🔵 BOTÓN: Copiar Match Keys
+    # 🔵 Botón: Copiar Match Keys
     # ================================
+    # Creamos un string con todos los event_key, uno por línea
     matchkeys_str = "\n".join(df["event_key"].astype(str).tolist())
+    # Lo serializamos como JSON para que se escape bien en JS
+    matchkeys_json = json.dumps(matchkeys_str)
 
-    copy_to_clipboard(
-        matchkeys_str,
-        "📋 Copiar Match Keys",                 # texto del botón
-        "✅ Match Keys copiados al portapapeles"  # mensaje de éxito
+    st.markdown(
+        f"""
+        <button
+            style="
+                margin-top: 0.5rem;
+                padding: 0.4rem 0.8rem;
+                border-radius: 0.3rem;
+                border: 1px solid #ccc;
+                cursor: pointer;
+                background-color: #f5f5f5;
+            "
+            onclick='navigator.clipboard.writeText({matchkeys_json}); alert("Match Keys copiados al portapapeles");'>
+            📋 Copiar Match Keys
+        </button>
+        """,
+        unsafe_allow_html=True,
     )
 
     st.download_button(
@@ -211,6 +225,9 @@ else:
         use_container_width=True
     )
 
+# -----------------------------
+# Guardar en Snowflake
+# -----------------------------
 if do_save:
     if df.empty:
         st.warning("No hay datos para guardar.")
