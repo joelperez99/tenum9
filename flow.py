@@ -14,13 +14,11 @@ st.title("🎾 Cargar Match Keys (API Tennis) → Snowflake")
 # Helpers credenciales
 # -----------------------------
 def _get_secret(name, default=""):
-    # Usa secrets de Streamlit Cloud primero, luego variables de entorno
     try:
         return st.secrets[name]
     except Exception:
         return os.getenv(name, default)
 
-# Lee credenciales Snowflake (desde Secrets o ENV)
 SF_ACCOUNT   = _get_secret("SF_ACCOUNT")
 SF_USER      = _get_secret("SF_USER")
 SF_PASSWORD  = _get_secret("SF_PASSWORD")
@@ -147,10 +145,9 @@ with col1:
 with col2:
     do_save = st.button("💾 Guardar en Snowflake")
 
-st.markdown("#### 📄 Plan B: subir JSON del API (si prefieres pegar el payload)")
+st.markdown("#### 📄 Plan B: subir JSON del API")
 upl = st.file_uploader("Archivo .json", type=["json"])
 
-# buffer de datos
 if "df_buf" not in st.session_state:
     st.session_state.df_buf = pd.DataFrame()
 
@@ -184,11 +181,23 @@ if upl is not None:
 
 st.markdown("---")
 st.subheader("📊 Vista previa")
+
 df = st.session_state.df_buf
+
 if df.empty:
-    st.info("Sin datos aún. Usa 'Traer desde API' o sube un JSON.")
+    st.info("Sin datos aún.")
 else:
     st.dataframe(df, use_container_width=True, height=420)
+
+    # ================================
+    # 🔵 NUEVO BOTÓN — Copiar Match Keys
+    # ================================
+    matchkeys_str = "\n".join(df["event_key"].astype(str).tolist())
+
+    if st.button("📋 Copiar Match Keys"):
+        st.copy_to_clipboard(matchkeys_str)
+        st.success("Match Keys copiados al portapapeles ✔️")
+
     st.download_button(
         "⬇️ Descargar CSV",
         df.to_csv(index=False).encode("utf-8"),
@@ -215,12 +224,14 @@ if do_save:
         finally:
             try:
                 cnx.close()
-            except Exception:
+            except:
                 pass
 
 st.markdown("---")
 st.subheader("🔎 Consulta rápida en Snowflake")
+
 lim = st.number_input("Límite", 1, 10000, 200, 50)
+
 q = f"""
 select event_key,event_date,event_time,first_player,second_player,
        tournament_name,event_type_type,event_status,
@@ -231,11 +242,13 @@ where source_date = to_date('{date_str}')
 order by tournament_name, event_time, event_key
 limit {int(lim)}
 """
+
 st.code(q, language="sql")
+
 try:
     cnx2 = get_sf_conn()
     df_db = pd.read_sql(q, cnx2)
     cnx2.close()
     st.dataframe(df_db, use_container_width=True, height=360)
 except Exception as e:
-    st.info(f"No se pudo consultar (¿tabla aún vacía?). Detalle: {e}")
+    st.info(f"No se pudo consultar Snowflake: {e}")
