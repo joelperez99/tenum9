@@ -104,17 +104,18 @@ def insert_df(cnx, df):
 # -----------------------------
 BASE_URL = "https://api.api-tennis.com/tennis/"
 
-def fetch_api(api_key: str, date_start_str: str, date_stop_str: str, timezone: str) -> dict:
+def fetch_api_day(api_key: str, date_str: str, timezone: str) -> dict:
     """
-    Llama a la API usando un rango de fechas [date_start_str, date_stop_str].
+    Llama a la API SOLO para un día concreto (date_start = date_stop = date_str).
+    Esto evita pedir rangos grandes que saturen la API.
     """
     r = requests.get(
         BASE_URL,
         params={
             "method": "get_fixtures",
             "APIkey": api_key,
-            "date_start": date_start_str,
-            "date_stop": date_stop_str,
+            "date_start": date_str,
+            "date_stop": date_str,
             "timezone": timezone
         },
         timeout=40
@@ -178,14 +179,52 @@ if do_fetch:
         st.error("Rango de fechas inválido. Corrige 'Fecha desde' y 'Fecha hasta'.")
     else:
         try:
-            payload = fetch_api(api_key.strip(), start_str, stop_str, timezone.strip())
-            if payload.get("success") != 1:
-                st.error(f"Error de API: {payload}")
+            total_dias = (fecha_hasta - fecha_desde).days + 1
+            barra = st.progress(0.0, text="Consultando API día por día...")
+            dfs = []
+            errores = []
+
+            for i in range(total_dias):
+                dia = fecha_desde + dt.timedelta(days=i)
+                dia_str = dia.strftime("%Y-%m-%d")
+                try:
+                    payload = fetch_api_day(api_key.strip(), dia_str, timezone.strip())
+                    if payload.get("success") != 1:
+                        errores.append(f"{dia_str}: success != 1 ({payload.get('message', payload)})")
+                    else:
+                        df_dia = normalize_result(payload.get("result"))
+                        if not df_dia.empty:
+                            dfs.append(df_dia)
+                except Exception as e:
+                    errores.append(f"{dia_str}: {e}")
+
+                barra.progress((i + 1) / total_dias, text=f"Consultando {dia_str} ({i+1}/{total_dias})")
+
+            if not dfs:
+                st.error("No se obtuvieron partidos en el rango seleccionado (o todos los días dieron error).")
+                if errores:
+                    st.warning("Detalle de errores:\n" + "\n".join(errores))
             else:
-                st.session_state.df_buf = normalize_result(payload.get("result"))
-                st.success(f"OK. {len(st.session_state.df_buf)} partidos entre {start_str} y {stop_str}.")
+                df_all = pd.concat(dfs, ignore_index=True)
+
+                # Opcional: eliminar duplicados por event_key
+                if "event_key" in df_all.columns:
+                    df_all = df_all.drop_duplicates(subset=["event_key"])
+
+                st.session_state.df_buf = df_all
+
+                msg = f"OK. {len(st.session_state.df_buf)} partidos entre {start_str} y {stop_str}, consultando día por día."
+                if errores:
+                    msg += f" Se encontraron algunos errores en ciertos días ({len(errores)}); revisa los detalles abajo."
+                st.success(msg)
+
+                if errores:
+                    with st.expander("Ver detalles de errores por día"):
+                        for e in errores:
+                            st.text(e)
+
         except Exception as e:
-            st.error(f"Error llamando API: {e}")
+            st.error(f"Error general llamando API: {e}")
 
 if upl is not None:
     try:
